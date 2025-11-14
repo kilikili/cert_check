@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-import ssl, socket, csv, smtplib, json, traceback, argparse, sys, os, logging
+import ssl, socket, smtplib, json, traceback, argparse, sys, os
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
-from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -14,14 +13,12 @@ CONFIG_FILE = os.path.join(SCRIPT_DIR, 'config.json')
 HOST_FILE = os.path.join(SCRIPT_DIR, "hosts.txt")
 EXCEL_FILE = os.path.join(SCRIPT_DIR, "cert_report.xlsx")
 
-# 設定本地時區（台灣 +08:00）
 LOCAL_TZ = timezone(timedelta(hours=8))
 
-# 設定 logging
-logging.basicConfig(format='%(asctime)s [%(levelname)s] %(message)s', level=logging.INFO, datefmt='%Y-%m-%d %H:%M:%S')
+# -------------------- Helper Functions --------------------
 
 def get_host_info():
-    """取得執行主機的資訊"""
+    """取得執行主機資訊"""
     hostname = socket.gethostname()
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -34,70 +31,57 @@ def get_host_info():
             ip_address = socket.gethostbyname(hostname)
         except:
             ip_address = "127.0.0.1"
-    script_path = os.path.abspath(__file__)
-    return {'hostname': hostname, 'ip': ip_address, 'script_path': script_path}
+    return {'hostname': hostname, 'ip': ip_address, 'script_path': os.path.abspath(__file__)}
 
-def get_cert_expiry(host, port=443, timeout=5, verify=False):
-    """取得憑證到期日（UTC）"""
+def get_cert_info(host, port=443, timeout=5):
+    """取得憑證資訊並產生安全建議"""
+    advice = []
+    expiry_utc = None
+    tls_version = "N/A"
+    sig_algo = "N/A"
+    key_size = "N/A"
+
     try:
         from cryptography import x509
         from cryptography.hazmat.backends import default_backend
-    except ImportError:
-        raise ImportError("請安裝 python3-cryptography 套件: pip install cryptography")
 
-    # 建立 SSL context
-    ctx = ssl._create_unverified_context() if not verify else ssl.create_default_context()
-    ctx.check_hostname = verify
-    ctx.verify_mode = ssl.CERT_REQUIRED if verify else ssl.CERT_NONE
-
-    # 設定低安全等級避免 WRONG_SIGNATURE_TYPE
-    try:
+        ctx = ssl._create_unverified_context()
         ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
-    except:
-        pass
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                tls_version = ssock.version()
+                der_cert = ssock.getpeercert(binary_form=True)
+                cert = x509.load_der_x509_certificate(der_cert, default_backend())
 
-    with socket.create_connection((host, port), timeout=timeout) as sock:
-        with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-            der_cert = ssock.getpeercert(binary_form=True)
-            if not der_cert:
-                raise ValueError(f"無法取得 {host}:{port} 憑證")
-            cert = x509.load_der_x509_certificate(der_cert, default_backend())
-            if hasattr(cert, "not_valid_after_utc"):
-                expiry = cert.not_valid_after_utc
-            else:
-                expiry = cert.not_valid_after.replace(tzinfo=timezone.utc)
-            # 取得 CN/SAN
-            try:
-                cn = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
-            except:
-                cn = ""
-            san = []
-            try:
-                ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-                san = ext.value.get_values_for_type(x509.DNSName)
-            except:
-                san = []
-            return expiry, cn, san
+                if hasattr(cert, "not_valid_after_utc"):
+                    expiry_utc = cert.not_valid_after_utc
+                else:
+                    expiry_utc = cert.not_valid_after.replace(tzinfo=timezone.utc)
 
-def check_host(host, port, now_utc, notify_days):
-    """檢查單一 host 的憑證狀態"""
-    try:
-        expiry_utc, cn, san = get_cert_expiry(host, port)
-        expiry_local = expiry_utc.astimezone(LOCAL_TZ).replace(tzinfo=None)  # 移除 timezone
-        days_left = (expiry_utc - now_utc).days
-        status = "OK" if days_left > notify_days else "ALERT"
+                sig_algo = cert.signature_hash_algorithm.name if cert.signature_hash_algorithm else "N/A"
+                key_size = cert.public_key().key_size if hasattr(cert.public_key(), "key_size") else "N/A"
 
-        # 資安建議
-        advice = []
-        if days_left <= notify_days:
-            advice.append("憑證即將到期，請更新")
-        if host not in san and host != cn:
-            advice.append("主機名與憑證 CN/SAN 不符，可能造成 MITM 風險")
-        advice_str = "; ".join(advice) if advice else "正常"
+                if sig_algo.lower() in ["sha1", "md5"]:
+                    advice.append(f"使用過舊簽章 {sig_algo}，建議更新為 SHA256+RSA/EC。")
+                if key_size != "N/A" and key_size < 2048:
+                    advice.append(f"公鑰長度 {key_size} 過短，建議 ≥2048。")
+                if tls_version in ["SSLv3", "TLSv1", "TLSv1.1"]:
+                    advice.append(f"支援舊版 TLS ({tls_version})，建議升級至 TLS1.2/1.3。")
 
-        return [host, port, expiry_local.strftime("%Y-%m-%d %H:%M:%S"), days_left, status, advice_str]
+                try:
+                    cn_list = [x.value for x in cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)]
+                    san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+                    san_list = san_ext.value.get_values_for_type(x509.DNSName)
+                    if host not in cn_list + san_list:
+                        advice.append("主機名與憑證 CN/SAN 不符，可能造成 MITM 風險。")
+                except:
+                    pass
+                if cert.issuer == cert.subject:
+                    advice.append("使用自簽憑證，建議改用受信任 CA 簽發憑證。")
     except Exception as e:
-        return [host, port, "", "", f"ERROR: {e}", str(e)]
+        advice.append(f"憑證檢查失敗：{e}")
+
+    return expiry_utc, tls_version, sig_algo, key_size, "; ".join(advice)
 
 def send_email(subject, body, cfg, attachment_path=None):
     msg = MIMEMultipart()
@@ -130,72 +114,84 @@ def send_email(subject, body, cfg, attachment_path=None):
             except:
                 pass
 
+# -------------------- 主程式 --------------------
+
+def check_host(host, port, now_utc, notify_days):
+    try:
+        expiry_utc, tls_version, sig_algo, key_size, advice = get_cert_info(host, port)
+        expiry_local = expiry_utc.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S") if expiry_utc else "N/A"
+        days_left = (expiry_utc - now_utc).days if expiry_utc else "N/A"
+        status = "OK" if expiry_utc and days_left > notify_days else "ALERT"
+        if expiry_utc and days_left <= notify_days:
+            advice = ("憑證即將到期，請更新；" + advice) if advice else "憑證即將到期，請更新。"
+        return [host, port, expiry_local, days_left, status, tls_version, sig_algo, key_size, advice]
+    except Exception as e:
+        return [host, port, "", "", f"ERROR: {e}", "N/A", "N/A", "N/A", f"檢查失敗：{e}"]
+
 def main():
-    parser = argparse.ArgumentParser(description="SSL 憑證到期監控工具")
+    parser = argparse.ArgumentParser(description="SSL 憑證到期監控工具 (多執行緒 + Excel)")
     parser.add_argument("--force-mail", action="store_true", help="即使沒有警告也強制寄出郵件")
-    parser.add_argument("--monitor", action="store_true", help="監控模式：回傳 FAIL/SUCCESS")
+    parser.add_argument("--monitor", action="store_true", help="監控模式")
     args = parser.parse_args()
 
     cfg = json.loads(Path(CONFIG_FILE).read_text(encoding='utf-8'))
     notify_days = cfg.get('notify_before_days', 30)
     max_threads = cfg.get('max_threads', 10)
 
-    hosts = []
-    for line in Path(HOST_FILE).read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        if ':' in line:
-            h, p = line.split(':',1)
-            hosts.append((h, int(p)))
-        else:
-            hosts.append((line, 443))
+    hosts = [line.strip() for line in Path(HOST_FILE).read_text().splitlines() if line.strip() and not line.startswith("#")]
 
-    logging.info(f"讀取 hosts: {HOST_FILE}")
+    now_local = datetime.now(LOCAL_TZ)
     now_utc = datetime.now(timezone.utc)
     rows, alerts = [], []
 
-    # 多執行緒 + tqdm
     with ThreadPoolExecutor(max_workers=max_threads) as executor:
-        futures = {executor.submit(check_host, h, p, now_utc, notify_days): (h, p) for h, p in hosts}
-        for future in tqdm(futures, total=len(futures), desc="Progress", ncols=60):
+        futures = []
+        for item in hosts:
+            if ':' in item:
+                host, port = item.split(':', 1)
+                port = int(port)
+            else:
+                host, port = item, 443
+            futures.append(executor.submit(check_host, host, port, now_utc, notify_days))
+        for future in as_completed(futures):
             row = future.result()
             rows.append(row)
-            # 即時列印
             if row[4] == "ALERT" or row[4].startswith("ERROR"):
-                logging.warning(f"{row[0]}:{row[1]} → {row[5]}")
-                alerts.append(f"{row[0]}:{row[1]} → {row[5]}")
-            else:
-                logging.info(f"{row[0]}:{row[1]} OK")
+                alerts.append(f"{row[0]}:{row[1]} → {row[8]}")
 
-    # Excel 輸出
-    df = pd.DataFrame(rows, columns=["Host","Port","Expiry","Days Left","Status","Security Advice"])
+    # 輸出 Excel
+    df = pd.DataFrame(rows, columns=["Host","Port","Expiry(Local)","Days Left","Status","TLS Version","Signature","Key Size","Security Advice"])
     df.to_excel(EXCEL_FILE, index=False)
-    logging.info(f"已寄出郵件（含 Excel 附件）。")
 
     email_cfg = cfg.get("email", {})
+    mail_enabled = email_cfg.get("enabled", False)
+    today_str = now_local.strftime("%Y-%m-%d")
     host_info = get_host_info()
-    today_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
 
-    # 發送郵件
-    if (alerts or args.force_mail) and email_cfg.get("enabled", False):
-        subject = f"[SSL 憑證到期報告] {today_str} - {len(alerts)} 個警告" if alerts else f"[SSL 憑證到期報告] {today_str} - 全部正常"
-        body = "\n".join(alerts) if alerts else f"所有網站 SSL 憑證離到期日仍有 {notify_days} 天以上。"
-        body += f"\n\n檢查主機: {host_info['hostname']} ({host_info['ip']})\n程式路徑: {host_info['script_path']}"
-        try:
-            send_email(subject, body, email_cfg, attachment_path=EXCEL_FILE)
-            logging.info("✅ 已寄出郵件（含 Excel 附件）。")
-        except Exception as e:
-            logging.error(f"❌ 寄送郵件失敗：{e}")
-            traceback.print_exc()
+    if args.monitor or (alerts and mail_enabled) or args.force_mail:
+        subject = f"[SSL 憑證監控] {today_str} - {len(alerts)} 個警告" if alerts else f"[SSL 憑證監控] {today_str} - 全部正常"
+        body = "\n".join(alerts) if alerts else "所有網站 SSL 憑證狀態正常。\n"
+        body += f"\n檢查時間：{now_local.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
+        body += f"主機名稱：{host_info['hostname']}\n主機 IP：{host_info['ip']}\n程式路徑：{host_info['script_path']}\n"
+        if mail_enabled:
+            try:
+                send_email(subject, body, email_cfg, attachment_path=EXCEL_FILE)
+                print("✅ 已寄出郵件（含 Excel 附件）。")
+            except Exception as e:
+                print(f"❌ 寄送郵件失敗：{e}")
+                traceback.print_exc()
 
-    # 監控模式 exit code
-    if args.monitor:
-        if alerts:
-            logging.error(f"檢查結果: FAIL ({len(alerts)} 個問題)")
+    if alerts:
+        print("="*60)
+        print("⚠️ SSL 憑證警告/錯誤")
+        for alert in alerts:
+            print(f"  • {alert}")
+        print("="*60)
+        if args.monitor:
             sys.exit(2)
-        else:
-            logging.info("檢查結果: SUCCESS")
+    else:
+        print("✅ 所有憑證狀態正常")
+        if args.monitor:
             sys.exit(0)
 
 if __name__ == "__main__":
