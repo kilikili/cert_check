@@ -3,14 +3,14 @@
   "verify_ssl": false,
   "email": {
     "enabled": true,
-    "smtp_server": "10.1.27.156",
+    "smtp_server": "127.0.0.1",
     "smtp_port": 25,
     "smtp_user": "",
     "smtp_password": "",
-    "smtp_from": "cert-check@sonet-tw.net.tw",
+    "smtp_from": "cert-check@test1.sample.com",
     "smtp_auth": false,
     "use_starttls": false,
-    "to": ["jason.chiang@sonet-tw.net.tw"]
+    "to": ["user@test1.sample.com"]
   },
   "slack": {
     "enabled": false,
