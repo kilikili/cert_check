@@ -1,3 +1,5 @@
 config.json
 hosts.txt
 cert_report.csv
+cert_report.xlsx
+cert_check.log

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import ssl, socket, smtplib, json, traceback, argparse, sys, os
+import ssl, socket, smtplib, json, traceback, argparse, sys, os, logging
 from datetime import datetime, timezone, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -16,6 +16,18 @@ EXCEL_FILE = os.path.join(SCRIPT_DIR, "cert_report.xlsx")
 LOCAL_TZ = timezone(timedelta(hours=8))
 
 # -------------------- Helper Functions --------------------
+
+def setup_logger(cfg):
+    log_file = cfg.get("log_file", "cert_check.log")
+    log_level = cfg.get("log_level", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
 
 def get_host_info():
     """取得執行主機資訊"""
@@ -53,14 +65,11 @@ def get_cert_info(host, port=443, timeout=5):
                 der_cert = ssock.getpeercert(binary_form=True)
                 cert = x509.load_der_x509_certificate(der_cert, default_backend())
 
-                if hasattr(cert, "not_valid_after_utc"):
-                    expiry_utc = cert.not_valid_after_utc
-                else:
-                    expiry_utc = cert.not_valid_after.replace(tzinfo=timezone.utc)
-
+                expiry_utc = getattr(cert, "not_valid_after_utc", cert.not_valid_after.replace(tzinfo=timezone.utc))
                 sig_algo = cert.signature_hash_algorithm.name if cert.signature_hash_algorithm else "N/A"
                 key_size = cert.public_key().key_size if hasattr(cert.public_key(), "key_size") else "N/A"
 
+                # 資安建議
                 if sig_algo.lower() in ["sha1", "md5"]:
                     advice.append(f"使用過舊簽章 {sig_algo}，建議更新為 SHA256+RSA/EC。")
                 if key_size != "N/A" and key_size < 2048:
@@ -68,16 +77,24 @@ def get_cert_info(host, port=443, timeout=5):
                 if tls_version in ["SSLv3", "TLSv1", "TLSv1.1"]:
                     advice.append(f"支援舊版 TLS ({tls_version})，建議升級至 TLS1.2/1.3。")
 
+                # CN/SAN 檢查
                 try:
                     cn_list = [x.value for x in cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)]
-                    san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-                    san_list = san_ext.value.get_values_for_type(x509.DNSName)
+                    san_list = []
+                    try:
+                        san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+                        san_list = san_ext.value.get_values_for_type(x509.DNSName)
+                    except:
+                        pass
                     if host not in cn_list + san_list:
                         advice.append("主機名與憑證 CN/SAN 不符，可能造成 MITM 風險。")
                 except:
                     pass
+
+                # 自簽檢查
                 if cert.issuer == cert.subject:
                     advice.append("使用自簽憑證，建議改用受信任 CA 簽發憑證。")
+
     except Exception as e:
         advice.append(f"憑證檢查失敗：{e}")
 
@@ -114,8 +131,6 @@ def send_email(subject, body, cfg, attachment_path=None):
             except:
                 pass
 
-# -------------------- 主程式 --------------------
-
 def check_host(host, port, now_utc, notify_days):
     try:
         expiry_utc, tls_version, sig_algo, key_size, advice = get_cert_info(host, port)
@@ -124,17 +139,22 @@ def check_host(host, port, now_utc, notify_days):
         status = "OK" if expiry_utc and days_left > notify_days else "ALERT"
         if expiry_utc and days_left <= notify_days:
             advice = ("憑證即將到期，請更新；" + advice) if advice else "憑證即將到期，請更新。"
+        logging.info(f"{host}:{port} → {advice}" if advice else f"{host}:{port} 狀態正常")
         return [host, port, expiry_local, days_left, status, tls_version, sig_algo, key_size, advice]
     except Exception as e:
+        logging.error(f"{host}:{port} 檢查失敗：{e}")
         return [host, port, "", "", f"ERROR: {e}", "N/A", "N/A", "N/A", f"檢查失敗：{e}"]
 
+# -------------------- 主程式 --------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="SSL 憑證到期監控工具 (多執行緒 + Excel)")
+    parser = argparse.ArgumentParser(description="SSL 憑證監控工具 (多執行緒 + Excel + 安全建議)")
     parser.add_argument("--force-mail", action="store_true", help="即使沒有警告也強制寄出郵件")
     parser.add_argument("--monitor", action="store_true", help="監控模式")
     args = parser.parse_args()
 
     cfg = json.loads(Path(CONFIG_FILE).read_text(encoding='utf-8'))
+    setup_logger(cfg)
     notify_days = cfg.get('notify_before_days', 30)
     max_threads = cfg.get('max_threads', 10)
 
@@ -143,6 +163,8 @@ def main():
     now_local = datetime.now(LOCAL_TZ)
     now_utc = datetime.now(timezone.utc)
     rows, alerts = [], []
+
+    logging.info(f"讀取 hosts: {HOST_FILE}, 共 {len(hosts)} 個主機")
 
     with ThreadPoolExecutor(max_workers=max_threads) as executor:
         futures = []
@@ -159,9 +181,9 @@ def main():
             if row[4] == "ALERT" or row[4].startswith("ERROR"):
                 alerts.append(f"{row[0]}:{row[1]} → {row[8]}")
 
-    # 輸出 Excel
     df = pd.DataFrame(rows, columns=["Host","Port","Expiry(Local)","Days Left","Status","TLS Version","Signature","Key Size","Security Advice"])
     df.to_excel(EXCEL_FILE, index=False)
+    logging.info(f"已輸出 Excel: {EXCEL_FILE}")
 
     email_cfg = cfg.get("email", {})
     mail_enabled = email_cfg.get("enabled", False)
@@ -176,21 +198,19 @@ def main():
         if mail_enabled:
             try:
                 send_email(subject, body, email_cfg, attachment_path=EXCEL_FILE)
-                print("✅ 已寄出郵件（含 Excel 附件）。")
+                logging.info("已寄出郵件（含 Excel 附件）")
             except Exception as e:
-                print(f"❌ 寄送郵件失敗：{e}")
+                logging.error(f"寄送郵件失敗：{e}")
                 traceback.print_exc()
 
     if alerts:
-        print("="*60)
-        print("⚠️ SSL 憑證警告/錯誤")
+        logging.error(f"檢查結果: FAIL ({len(alerts)} 個問題)")
         for alert in alerts:
             print(f"  • {alert}")
-        print("="*60)
         if args.monitor:
             sys.exit(2)
     else:
-        print("✅ 所有憑證狀態正常")
+        logging.info("所有憑證狀態正常")
         if args.monitor:
             sys.exit(0)
 
