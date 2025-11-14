@@ -43,14 +43,8 @@ def get_host_info():
     }
 
 def get_cert_expiry(host, port=443, timeout=5, verify=False):
-    """取得憑證到期日（UTC）
-    
-    Args:
-        host: 主機名稱
-        port: 連接埠（預設 443）
-        timeout: 連線逾時秒數
-        verify: 是否驗證憑證有效性（預設 False，只取得到期時間）
-    """
+    """取得憑證到期日（UTC）"""
+
     if verify:
         # 完整驗證模式
         ctx = ssl.create_default_context()
@@ -59,52 +53,44 @@ def get_cert_expiry(host, port=443, timeout=5, verify=False):
                 cert = ssock.getpeercert()
                 if not cert:
                     raise ValueError(f"無法從 {host}:{port} 取得憑證")
-                
+
                 not_after = cert.get('notAfter')
                 if not not_after:
                     raise ValueError(f"{host}:{port} 的憑證缺少 notAfter 欄位")
-                
+
                 expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
                 return expiry
+
     else:
-        # 監控模式：只取得憑證，不驗證
-        # 使用 DER 格式取得憑證並手動解析
+        # 監控模式：不驗證憑證，只取得日期
         try:
-            # 嘗試使用 cryptography 庫（最可靠）
             from cryptography import x509
             from cryptography.hazmat.backends import default_backend
-            
-            # 使用不驗證的 context 取得憑證
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            
+
+            # 使用較寬鬆的 context 避免 WRONG_SIGNATURE_TYPE
+            ctx = ssl._create_unverified_context()
+            ctx.set_ciphers("DEFAULT:@SECLEVEL=0")
+
             with socket.create_connection((host, port), timeout=timeout) as sock:
                 with ctx.wrap_socket(sock, server_hostname=host) as ssock:
-                    # 取得 DER 格式的憑證（binary）
                     der_cert = ssock.getpeercert(binary_form=True)
                     if not der_cert:
                         raise ValueError(f"無法從 {host}:{port} 取得憑證")
-                    
-                    # 使用 cryptography 解析憑證
+
                     cert = x509.load_der_x509_certificate(der_cert, default_backend())
-                    
-                    # 相容舊版 cryptography (< 42.0.0)
-                    # 舊版用 not_valid_after (naive datetime)
-                    # 新版用 not_valid_after_utc (aware datetime)
-                    if hasattr(cert, 'not_valid_after_utc'):
+
+                    # 新舊版 cryptography 相容
+                    if hasattr(cert, "not_valid_after_utc"):
                         expiry = cert.not_valid_after_utc
                     else:
-                        # 舊版：手動加上 UTC 時區
                         expiry = cert.not_valid_after.replace(tzinfo=timezone.utc)
-                    
+
                     return expiry
+
         except ImportError:
-            # 如果沒有 cryptography，使用替代方案：解析 PEM
+            # Fallback: 用 openssl CLI 解析 PEM
             pem_cert = ssl.get_server_certificate((host, port), timeout=timeout)
-            
-            # 手動解析 PEM 中的日期（簡單但有效）
-            # 使用 openssl 命令或直接解析
+
             import subprocess
             try:
                 result = subprocess.run(
@@ -115,20 +101,12 @@ def get_cert_expiry(host, port=443, timeout=5, verify=False):
                     timeout=5
                 )
                 if result.returncode == 0:
-                    # 輸出格式: notAfter=Jan 15 12:00:00 2025 GMT
                     date_str = result.stdout.strip().split('=')[1]
                     expiry = datetime.strptime(date_str, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
                     return expiry
-            except (subprocess.TimeoutExpired, FileNotFoundError, IndexError):
+            except:
                 pass
-            
-            # 最後的備用方案：使用 ssl.PEM_cert_to_DER_cert 和手動解析
-            from ssl import PEM_cert_to_DER_cert
-            der_cert = PEM_cert_to_DER_cert(pem_cert)
-            
-            # 簡單的 DER 解析來找到日期（這是最後手段）
-            # DER 編碼中的日期通常在特定位置
-            # 這裡我們回退到嘗試 openssl
+
             raise ValueError(f"無法解析 {host}:{port} 的憑證，請安裝 python3-cryptography 套件")
 
 def send_email(subject, body, cfg, attachment_path=None):
