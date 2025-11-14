@@ -1,4 +1,5 @@
-test.sample.com
-test3.sample.com/Nonapp
-test1.sample.com
-test2.sample.com
+# 目標主機:port，若沒指定 port 預設 443
+example.com
+google.com:443
+expired.badssl.com
+wrong.host.badssl.com

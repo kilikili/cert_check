@@ -1,6 +1,11 @@
 {
   "notify_before_days": 30,
   "verify_ssl": false,
+  "max_threads": 20,
+  "connect_timeout": 6,
+  "progress_bar": true,
+  "log_file": "cert_check.log",
+  "log_level": "INFO",
   "email": {
     "enabled": true,
     "smtp_server": "127.0.0.1",
