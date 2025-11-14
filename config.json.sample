@@ -1,0 +1,19 @@
+{
+  "notify_before_days": 30,
+  "verify_ssl": false,
+  "email": {
+    "enabled": true,
+    "smtp_server": "10.1.27.156",
+    "smtp_port": 25,
+    "smtp_user": "",
+    "smtp_password": "",
+    "smtp_from": "cert-check@sonet-tw.net.tw",
+    "smtp_auth": false,
+    "use_starttls": false,
+    "to": ["jason.chiang@sonet-tw.net.tw"]
+  },
+  "slack": {
+    "enabled": false,
+    "webhook_url": ""
+  }
+}

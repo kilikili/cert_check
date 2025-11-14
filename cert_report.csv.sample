@@ -1,0 +1,5 @@
+Host,Port,Expiry (Local Time),Days Left,Status,Check Time (Local Time)
+test.sample.com,443,2025-12-24 07:59:59,39,OK,2025-11-14T09:06:33.218405+08:00
+test3.sample.com/Nonapp,443,,,ERROR: [Errno -2] Name or service not known,2025-11-14T09:06:33.218405+08:00
+test1.sample.com,443,2025-12-12 07:59:59,27,ALERT,2025-11-14T09:06:33.218405+08:00
+test2.sample.com,443,2025-12-04 07:59:59,19,ALERT,2025-11-14T09:06:33.218405+08:00
